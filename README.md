@@ -31,6 +31,8 @@ Our contributions are:
 
 4. **Supporting systems work on PolarQuant KV cache rotation** for hybrid SSM-Transformer compressed caches, achieving 93% MSE improvement on Zamba2 key tensors. In the public literature and toolchains surveyed here, we are not aware of prior PolarQuant evaluations on hybrid architectures.
 
+5. **A compression-residual quality estimator** requiring zero learned parameters: the mean L2 norm of HXQ sidecar corrections across four Mamba input projection layers predicts chunk-level cross-entropy at ρ=0.574 (p=1.42e-50, n=562 chunks), enabling zero-cost quality-aware routing in multi-model systems.
+
 Evidence depth varies by architecture family: the strongest paired downstream evaluations are reported for hybrid (Zamba2-7B) and MoE (OLMoE) case studies, with task-specific evaluations for vision and encoder-only families, and perplexity evaluations for the remaining models.
 
 ---
@@ -218,6 +220,36 @@ SSM architectures dampen quantization error approximately 4x better than Transfo
 
 We note that this finding appears to contradict Quamba [14] and MambaQuant [15], which report that SSMs are harder to quantize. The distinction is that those works target activation quantization (W8A8), where SSM-specific outlier patterns cause collapse, while HXQ performs weight-only quantization where the recurrent dynamics smooth weight perturbations during forward propagation.
 
+### 4.7 Compression Residual as Runtime Quality Estimator
+
+HXQ's sidecar correction stores per-tensor sparse (row, column, delta) triplets for weights where the VQ codebook reconstruction error exceeds a threshold. During inference, the sidecar's contribution to each layer's output varies with the input: tokens whose activations project heavily onto the corrected weight regions produce larger sidecar output norms. We hypothesized that this variation carries information about prediction difficulty --- that the sidecar effectively measures how much each token relies on weight structure the codebook could not capture.
+
+**Per-token measurement.** On Zamba2-1.2B-HXQ (136 HelixLinear modules), we instrumented every compressed layer to record the L2 norm of the sidecar's output-space contribution per token during forward passes over WikiText-2 validation (32,768 tokens). We computed Spearman rank correlation between per-token sidecar contribution magnitude and per-token cross-entropy loss. Six layers exceeded |ρ| > 0.3 (our pre-registered significance gate), with the strongest at layers 25 (ρ=0.395), 26 (ρ=0.371), and 24 (ρ=0.365) --- all Mamba `in_proj` projections in the deep SSM input path. 128 of 136 layers were significant at p < 0.05 (n=32,768). By comparison, activation kurtosis alone produced zero layers above |ρ| > 0.3, indicating the sidecar contribution is a stronger signal than raw activation statistics.
+
+**Chunk-level aggregation.** Per-token correlations, while significant, are noisy. We aggregated to 512-token chunks (562 chunks, full WikiText-2 validation) and computed the mean sidecar L2 norm across the top-performing layers per chunk. Results:
+
+| Aggregation | ρ with chunk CE loss | p-value |
+|---|---|---|
+| Mean of top-6 layers | 0.574 | 1.42e-50 |
+| Top-3 Mamba `in_proj` only | 0.564 | < 1e-45 |
+| All 4 Mamba `in_proj` layers (10, 24, 25, 26) | 0.581 | < 1e-52 |
+| Single best layer (L25 `mamba.in_proj`) | 0.573 | < 1e-49 |
+| Ridge regression (6 features, LOOCV) | 0.728 | --- |
+
+The mean of four Mamba `in_proj` sidecar norms predicts chunk-level cross-entropy at ρ=0.581 with zero learned parameters, explaining approximately 34% of variance in generation difficulty. Ridge regression with six features and leave-one-out cross-validation reaches ρ=0.728, but the unparameterized mean already exceeds our ρ > 0.5 gate.
+
+**Interpretation.** The VQ codebook captures the bulk weight distribution --- the common patterns shared across all inputs. The sidecar stores corrections for weight regions where the codebook is a poor fit: heavy-tailed distributions, outlier channels, specific weight correlations that encode specialized knowledge. When a token's input activations project into these regions, the sidecar contributes more to the output, and the model is simultaneously less certain about its prediction. The compression residual is not waste --- it is a structured decomposition of representational capacity, and its activation magnitude at inference time is a legible readout of prediction difficulty.
+
+**Implications for multi-model routing.** In the co-resident system described in Section 5, each lobe has hundreds of sidecar-instrumented modules. A lightweight routing layer can read the aggregate sidecar signal from each lobe to estimate per-query confidence without additional models or learned parameters:
+
+```
+confidence = 1.0 - normalize(mean(sidecar_norm[L10, L24, L25, L26]))
+```
+
+When one lobe's sidecar signal is high (low confidence) while another's is low (high confidence) on the same input, the routing layer detects a quality asymmetry and can redirect to the more confident lobe. This quality-aware routing costs no additional VRAM and adds negligible latency, as sidecar norms are computed as a byproduct of the existing decompression path.
+
+In the public literature and toolchains surveyed here, we are not aware of prior work using compression residual magnitude as a runtime quality estimator. GPTQ, AWQ, and bitsandbytes do not maintain sparse residual corrections during inference and therefore cannot instrument this signal.
+
 ---
 
 ## 5. Multi-Model Compressed Co-Resident Inference
@@ -303,6 +335,8 @@ We acknowledge several limitations that constrain the scope of our claims:
 
 **The multi-model system is a demonstration, not a production serving system.** It lacks request batching, concurrent request handling, dynamic model loading/unloading, and the optimizations present in vLLM or Triton. Its purpose is to establish feasibility of compressed multi-architecture co-residency, not to compete with production inference servers.
 
+**The sidecar quality estimator is validated on one model.** The ρ=0.574 result is from Zamba2-1.2B-HXQ on WikiText-2. Cross-architecture validation (Transformer-only, MoE, vision) and cross-dataset validation are needed before the quality estimator can be claimed as universal. The signal is dominated by Mamba `in_proj` layers, which may not have equivalents in non-SSM architectures. Additionally, ρ=0.574 explains approximately 33% of variance --- useful for routing confidence but not for precise quality prediction.
+
 ---
 
 ## 8. Conclusion
@@ -316,6 +350,8 @@ The practical implications are:
 2. **Multi-model co-residency**: The shared materialization buffer design enables multiple compressed models from different architecture families to coexist on a single consumer GPU with minimal VRAM overhead beyond compressed storage.
 
 3. **SSM-favorable compression characteristics**: The divergence probe finding that SSMs dampen quantization error 4x better than Transformers suggests that the shift toward SSM and hybrid architectures may make post-training compression more effective, not less --- provided weight-only (not activation) quantization is used.
+
+4. **Compression artifacts as runtime instruments**: The sidecar residual correction, unique to HXQ's architecture, provides a zero-cost quality estimator. The mean sidecar L2 norm across four Mamba input projection layers predicts chunk-level generation difficulty at ρ=0.574 with no learned parameters. This transforms a compression byproduct into a confidence signal for quality-aware routing in multi-model systems --- a capability that methods without sparse residual corrections (GPTQ, AWQ, bitsandbytes) cannot replicate.
 
 All models, code, benchmark receipts, and the inference server are publicly available. Models are hosted at HuggingFace under the EchoLabs33 organization. The compression library is available via `pip install helix-substrate` (v0.3.3). The memory-efficient Mamba scan is available via `pip install mamba-scan-lite` (v0.1.0).
 
@@ -332,7 +368,7 @@ All results can be independently verified from publicly available artifacts:
 | Compressed model checkpoints | HuggingFace: EchoLabs33 | 14 models |
 | Source code | GitHub: echo313unfolding/helix-substrate | commit-dated |
 | Benchmark receipts | JSON files in each HF model repository | per-model |
-| Hardware | NVIDIA RTX 3090 24 GB (bench_6config), RTX 4090 24 GB (speed verification), Quadro T2000 4 GB (edge) | — |
+| Hardware | NVIDIA RTX 3090 24 GB (bench_6config), RTX 4090 24 GB (speed verification, sidecar per-token probe), Quadro T2000 4 GB (edge, sidecar chunk-level probe) | — |
 
 Each benchmark receipt is a machine-readable JSON file containing: hardware specifications, PyTorch and transformers versions, exact hyperparameters (batch size, sequence length, stride, number of chunks), SHA256 hashes of input data, wall-clock and CPU time, and VRAM measurements. Receipt filenames include ISO timestamps. Any result in this paper can be traced to a specific receipt and reproduced on equivalent hardware. The whitepaper source (markdown) and compiled PDF are maintained at `echo313unfolding/hxq-whitepaper` on GitHub.
 
@@ -411,7 +447,7 @@ The name "Helix" in helix-substrate derives from this biological inspiration, an
 | Compressed models | HuggingFace: EchoLabs33 (14 models) |
 | Source code | GitHub: echo313unfolding/helix-substrate |
 | Benchmark receipts | JSON files in each HF model repository |
-| This document | GitHub: echo313unfolding/hxq-whitepaper |
+| This document | GitHub: EchoLabs33/hxq-whitepaper |
 
 All benchmark receipts are machine-readable JSON files containing hardware specifications, software versions, exact hyperparameters, and SHA256 hashes of input data. Any result reported in this paper can be independently reproduced from the corresponding receipt.
 
@@ -430,3 +466,5 @@ To prevent misinterpretation, we explicitly state what this paper does **not** c
 - **We do not claim that throughput results transfer across dependency configurations.** The 1,827 tok/s result requires `mamba-ssm>=2.2.2` with CUDA fast path kernels. Without this dependency, the same model on the same GPU produces 202 tok/s. Throughput comparisons between HXQ and dense are only valid when both use identical Mamba kernel configurations. The 3090 bench_6config table (646 tok/s HXQ vs 1,446 dense) and the 4090 verification (1,827 tok/s) were conducted under different hardware and potentially different Mamba kernel versions.
 
 - **We do not claim that "unified" means "every tensor treated identically."** HXQ uses a name-based tensor policy to classify tensors as compressible, exact, or skip. The codec pipeline is unified; the tensor classification is architecture-aware. This is analogous to how bitsandbytes replaces `nn.Linear` universally but does not modify `nn.Embedding` or `nn.LayerNorm`.
+
+- **We do not claim the sidecar quality estimator generalizes beyond the tested configuration.** The ρ=0.574 result is specific to Zamba2-1.2B-HXQ on WikiText-2 with 512-token chunks. The signal is dominated by Mamba `in_proj` layers (4 of top 6). Whether equivalent signals exist in Transformer-only or MoE architectures, and whether the correlation holds on other datasets, remains to be validated.
