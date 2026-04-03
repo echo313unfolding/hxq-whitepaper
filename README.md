@@ -9,7 +9,7 @@ Echo Labs LLC | Michigan
 
 ## Abstract
 
-Existing weight compression methods (GPTQ, AWQ, bitsandbytes) are designed and tested primarily on decoder-only Transformers. We present HXQ, a calibration-free vector quantization codec that compresses any `nn.Linear` layer through per-tensor k-means, optional 2D VQ with 12-bit index packing, and sparse sidecar correction --- requiring no architecture-specific calibration. We demonstrate near-lossless downstream performance across six architecture families: Zamba2-7B hybrid SSM-Transformer (HellaSwag +0.27% vs dense), OLMoE 64-expert MoE (-0.16%), CLIP ViT-L/14 vision-text (CIFAR-100 top-1 +0.27%), plus decoder Transformers, pure SSMs, and encoder-only models. End-to-end throughput on Zamba2-7B reaches 1,827 tok/s on RTX 4090 (exceeding dense BF16) at 60% VRAM reduction, with HXQ decompression accounting for only 7.4% of forward-pass time. We further demonstrate compressed multi-architecture co-resident inference: three models from different families sharing one materialization buffer across 683 modules at 10.3 GB on a single 24 GB GPU. All 14 models, code, and benchmark receipts are publicly available via PyPI and HuggingFace.
+Existing weight compression methods (GPTQ, AWQ, bitsandbytes) are designed and tested primarily on decoder-only Transformers. We present HXQ, a calibration-free vector quantization codec that compresses any `nn.Linear` layer through per-tensor k-means, optional 2D VQ with 12-bit index packing, and sparse sidecar correction --- requiring no architecture-specific calibration. We demonstrate near-lossless downstream performance across six architecture families, with the strongest evidence on Zamba2-7B hybrid SSM-Transformer (HellaSwag +0.27% vs dense), OLMoE 64-expert MoE (-0.16%), and CLIP ViT-L/14 vision-text (CIFAR-100 top-1 +0.27%). With the required Mamba CUDA fast path installed, HXQ buffered inference reaches 1,827 tok/s on RTX 4090; on RTX 3090, HXQ buffered inference reaches 646 tok/s versus 1,446 tok/s dense under the matched 50x512-token benchmark, at 60% VRAM reduction. We further demonstrate compressed multi-architecture co-resident inference: three models from different families sharing one materialization buffer across 683 modules at 10.3 GB on a single 24 GB GPU.
 
 ---
 
@@ -23,13 +23,15 @@ We introduce HXQ (Helix Quantization), a calibration-free weight compression cod
 
 Our contributions are:
 
-1. **A unified compression codec spanning six architecture families**, demonstrated with 14 publicly available compressed models on HuggingFace, each with paired dense-vs-compressed downstream evaluations.
+1. **A unified compression codec spanning six architecture families**, demonstrated with 14 publicly available compressed models on HuggingFace, with paired dense-vs-compressed downstream evaluations on the strongest case studies (Zamba2-7B, OLMoE) and receipt-backed evaluations across the remaining families.
 
 2. **2D vector quantization with 12-bit packed indices**, achieving 6 bits per weight with quality that exceeds bitsandbytes 4-bit NF4 on Zamba2-7B (PPL 5.015 vs 5.066) at 60% VRAM reduction.
 
 3. **A shared weight materialization buffer** enabling compressed multi-architecture co-resident inference: three models from different architecture families loaded simultaneously on one GPU, sharing a single class-level buffer across all compressed modules.
 
-4. **Supporting systems work on PolarQuant KV cache rotation** for hybrid SSM-Transformer compressed caches, achieving 93% MSE improvement on Zamba2 key tensors --- to our knowledge, the first such evaluation in publicly available literature on hybrid architectures.
+4. **Supporting systems work on PolarQuant KV cache rotation** for hybrid SSM-Transformer compressed caches, achieving 93% MSE improvement on Zamba2 key tensors. In the public literature and toolchains surveyed here, we are not aware of prior PolarQuant evaluations on hybrid architectures.
+
+Evidence depth varies by architecture family: the strongest paired downstream evaluations are reported for hybrid (Zamba2-7B) and MoE (OLMoE) case studies, with task-specific evaluations for vision and encoder-only families, and perplexity evaluations for the remaining models.
 
 ---
 
@@ -43,7 +45,7 @@ Advanced VQ-based methods have pushed quality at extreme compression ratios. QuI
 
 ### 2.2 SSM-Specific Quantization
 
-Recent work has established that state space models present unique quantization challenges. Quamba [14] (ICLR 2025) discovered highly sensitive feature maps within the selective scan mechanism and massive outlier activations absent in attention modules, with naive 8-bit quantization causing complete model collapse. MambaQuant [15] (ICLR 2025) demonstrated that standard rotation-based approaches (QuaRot) fail on Mamba due to inconsistent channel variances, requiring Karhunen-Loeve Transformation instead. Additional work includes Q-Mamba [16], QMamba [17], SSDi8, and Slender-Mamba [18]. Critically, none of these methods have shipped compressed model checkpoints to public repositories --- they remain papers without deployable artifacts.
+Recent work has established that state space models present unique quantization challenges. Quamba [14] (ICLR 2025) discovered highly sensitive feature maps within the selective scan mechanism and massive outlier activations absent in attention modules, with naive 8-bit quantization causing complete model collapse. MambaQuant [15] (ICLR 2025) demonstrated that standard rotation-based approaches (QuaRot) fail on Mamba due to inconsistent channel variances, requiring Karhunen-Loeve Transformation instead. Additional work includes Q-Mamba [16], QMamba [17], SSDi8, and Slender-Mamba [18]. Critically, we are not aware of public, maintained compressed checkpoint releases accompanying these methods in the way HXQ distributes artifacts through HuggingFace.
 
 ### 2.3 Vector Quantization for Neural Network Weights
 
@@ -51,7 +53,7 @@ VQ for weight compression dates to Gong et al. (2014) and was prominently featur
 
 ### 2.4 KV Cache Compression
 
-TurboQuant [21] (Google, ICLR 2026) represents the current state of the art for KV cache compression, achieving 6x reduction through PolarQuant rotation followed by scalar quantization. The PolarQuant rotation --- a random orthogonal transformation that spreads outlier-dimension energy uniformly across all coordinates --- is the core innovation. The secondary QJL component has been contested by six independent implementation teams who found that softmax exponentially amplifies QJL's variance, making MSE-only quantization superior for generation quality. KIVI [22], KVQuant [23], and GEAR provide complementary approaches. To our knowledge, no KV cache compression has been specifically evaluated on hybrid SSM-Transformer architectures, where only the attention layers (a minority of total layers) maintain KV caches while SSM layers maintain fixed-size recurrent state.
+TurboQuant [21] (Google, ICLR 2026) represents the current state of the art for KV cache compression, achieving 6x reduction through PolarQuant rotation followed by scalar quantization. The PolarQuant rotation --- a random orthogonal transformation that spreads outlier-dimension energy uniformly across all coordinates --- is the core innovation. The secondary QJL component has been contested by six independent implementation teams who found that softmax exponentially amplifies QJL's variance, making MSE-only quantization superior for generation quality. KIVI [22], KVQuant [23], and GEAR provide complementary approaches. In the public literature and toolchains surveyed here, we are not aware of KV cache compression specifically evaluated on hybrid SSM-Transformer architectures, where only the attention layers (a minority of total layers) maintain KV caches while SSM layers maintain fixed-size recurrent state.
 
 ### 2.5 Multi-Model Inference
 
@@ -93,7 +95,7 @@ The key design decision is a **class-level shared buffer**: `HelixLinear._shared
 
 The per-forward decompression cost is dominated by the index gather operation: reading packed uint8 bytes, extracting 12-bit indices, and looking up codebook entries. We implement a fused Triton kernel (`triton_gather_12bit.py`) that performs this in a single GPU kernel launch: packed bytes are read from global memory, 12-bit indices are extracted via bit manipulation, codebook entries (32 KB, fitting in shared memory) are looked up, and BF16 weights are written directly to the output buffer. No intermediate allocations occur.
 
-Speed progression during development: 46 tok/s (naive tiled) to 281 tok/s (fused Triton matmul) to 570 tok/s (shared buffer, PyTorch gather) to **646 tok/s** (index_select optimization + shared buffer). With the Mamba CUDA fast path installed (`mamba-ssm` with `causal-conv1d`), end-to-end throughput reaches **1,827 tok/s on RTX 4090** and approximately 1,764 tok/s on RTX 3090 --- exceeding the dense BF16 baseline.
+Speed progression during development: 46 tok/s (naive tiled) to 281 tok/s (fused Triton matmul) to 570 tok/s (shared buffer, PyTorch gather) to **646 tok/s** (index_select optimization + shared buffer). With the Mamba CUDA fast path installed (`mamba-ssm` with `causal-conv1d`), end-to-end throughput reaches **1,827 tok/s on RTX 4090** in our verification harness; on RTX 3090, the matched 50x512-token benchmark reports 646 tok/s for HXQ buffered inference versus 1,446 tok/s dense.
 
 Profiling reveals why: HXQ decompression (gather + sidecar + matmul) accounts for only **7.4% of forward-pass time** on Zamba2-7B. The remaining 92.6% is non-HelixLinear computation (Mamba scan, attention, layer normalization). Without the Mamba CUDA fast path, a naive Python sequential scan dominates the forward pass, producing only 202 tok/s regardless of decompression efficiency. The compressed representation reduces model VRAM from 14 GB to 5.7 GB, and the per-layer decompression overhead (0.93 ms per HelixLinear module vs 0.39 ms pure cuBLAS) is amortized across the full forward pass.
 
@@ -146,7 +148,7 @@ Zamba2-7B-Instruct [6] is a hybrid architecture with 32 Mamba-2 layers and 6 sha
 
 An independent verification on RTX 4090 (same methodology, 50x512 tokens) measured **1,827 tok/s** for the HXQ buffered path with `mamba-ssm>=2.2.2` installed. The difference from the 3090 result (646 tok/s) reflects both the faster GPU and potential differences in Mamba CUDA kernel versions. Without `mamba-ssm` installed, the same 4090 benchmark measured only 202 tok/s due to HuggingFace's naive Python Mamba fallback consuming 92.6% of forward-pass time.
 
-HXQ at 6 bits/weight achieves better quality than bnb 4-bit NF4 (PPL 5.019 vs 5.066) at comparable VRAM (5,657 vs 5,129 MB). The buffered path on 3090 is 2.2x slower than dense (646 vs 1,446), but on 4090 hardware with current Mamba kernels, HXQ throughput exceeds the 3090 dense baseline.
+HXQ at 6 bits/weight achieves better quality than bnb 4-bit NF4 at comparable VRAM on the matched RTX 3090 benchmark (PPL 5.019 vs 5.066; VRAM 5,657 vs 5,129 MB). Separate RTX 4090 verification demonstrates that, with the required Mamba fast path installed, buffered HXQ inference can exceed 1.8k tok/s.
 
 **Throughput methodology.** All tok/s measurements use the same harness: 50 non-overlapping 512-token chunks from WikiText-2, batch size 1, BF16 compute dtype. Throughput is measured as total tokens processed divided by total wall-clock time including all decompression overhead. The PPL values in this table differ from the strided-window PPL above because they use non-overlapping windows (less context per token) rather than overlapping 2048-token windows with 512-token stride. Both dense and HXQ configurations use identical chunking, so relative comparisons within this table are valid. Profiling on RTX 4090 shows HXQ decompression (gather + sidecar + cuBLAS matmul) accounts for 7.4% of total forward-pass time; the remaining 92.6% is non-compressed computation (Mamba scan, attention, normalization).
 
@@ -201,11 +203,13 @@ Storage: 421 MB dense to 106 MB HXQ (4.0x compression).
 | Vision-Text | CLIP ViT-L/14 | 3.6x | Top-1 +0.27% |
 | Encoder-Only | BERT-base | 4.0x | MLM -0.40% |
 
-14 models across 6 architecture families, all compressed with the same codec and the same `pip install helix-substrate`. *Note: this summary table spans different evaluation protocols by architecture family; "Best Eval Delta" reports the most favorable metric from each family's evaluation suite. Exact protocols and full results are detailed per-family in Sections 4.1--4.4 and in the JSON receipts accompanying each HuggingFace model.*
+14 models across 6 architecture families, all compressed with the same codec (`pip install helix-substrate`). Auxiliary packages provide architecture-specific fast paths: `mamba-scan-lite` for memory-efficient SSM inference on small GPUs, and `mamba-ssm`/`causal-conv1d` for CUDA-accelerated Mamba inference on Ampere+ hardware.
+
+> **Note on Table 4.** This summary spans different evaluation protocols by architecture family. "Best Eval Delta" reports the most favorable metric from each family's evaluation suite. Evidence depth varies: Zamba2-7B and OLMoE have full paired downstream evaluations; CLIP and BERT have task-specific evaluations; pure SSM and decoder Transformer families have perplexity evaluations. Exact protocols are detailed per-family in Sections 4.1--4.4 and in the JSON receipts accompanying each HuggingFace model.
 
 ### 4.6 Divergence Probe: SSM Error Dampening
 
-We measured layer-wise quantization error amplification across architectures by injecting quantization noise at each layer and measuring output divergence:
+We measured layer-wise quantization error amplification by comparing dense and HXQ-compressed model outputs at each layer boundary. For each layer *l*, we computed the ratio of output divergence (L2 norm of the difference between dense and compressed hidden states) to input divergence at that layer. Total amplification is the product of per-layer ratios across the full model depth. This was measured on 100 randomly sampled 512-token sequences from WikiText-2:
 
 - **TinyLlama (Transformer, 22 layers)**: 33.4x total error amplification
 - **Mamba-130M (SSM, 24 layers)**: 8.7x total amplification; layers 8-17 actively attenuate error
@@ -241,7 +245,7 @@ An input router dispatches queries to the appropriate model based on content ana
 
 ### 5.3 Smoke Test Results
 
-A 15-query test battery covering all modalities:
+A scripted 15-query test battery covering all modalities, with pass/fail determined by automated string matching for factual queries, syntax validation for code generation, and label correctness for vision classification:
 
 | Category | Tests | Result |
 |---|---|---|
@@ -279,7 +283,7 @@ Benchmarked on real KV cache tensors captured from Zamba2-1.2B inference across 
 
 Layer-by-layer analysis shows PolarQuant is most effective at deeper layers (5-35) where channel outlier concentration is highest. Layer 0-1 shows minimal improvement (<10%) because early layers have relatively uniform channel distributions. PolarQuant is set as the default in the released configuration.
 
-We are not aware of prior evaluations of PolarQuant rotation specifically on hybrid SSM-Transformer KV caches in publicly available literature.
+In the public literature and toolchains surveyed here, we are not aware of prior evaluations of PolarQuant rotation on hybrid SSM-Transformer KV caches.
 
 ---
 
@@ -330,7 +334,7 @@ All results can be independently verified from publicly available artifacts:
 | Benchmark receipts | JSON files in each HF model repository | per-model |
 | Hardware | NVIDIA RTX 3090 24 GB (bench_6config), RTX 4090 24 GB (speed verification), Quadro T2000 4 GB (edge) | — |
 
-Each benchmark receipt is a machine-readable JSON file containing: hardware specifications, PyTorch and transformers versions, exact hyperparameters (batch size, sequence length, stride, number of chunks), SHA256 hashes of input data, wall-clock and CPU time, and VRAM measurements. Receipt filenames include ISO timestamps. Any result in this paper can be traced to a specific receipt and reproduced on equivalent hardware.
+Each benchmark receipt is a machine-readable JSON file containing: hardware specifications, PyTorch and transformers versions, exact hyperparameters (batch size, sequence length, stride, number of chunks), SHA256 hashes of input data, wall-clock and CPU time, and VRAM measurements. Receipt filenames include ISO timestamps. Any result in this paper can be traced to a specific receipt and reproduced on equivalent hardware. The whitepaper source (markdown) and compiled PDF are maintained at `echo313unfolding/hxq-whitepaper` on GitHub.
 
 ---
 
@@ -407,7 +411,7 @@ The name "Helix" in helix-substrate derives from this biological inspiration, an
 | Compressed models | HuggingFace: EchoLabs33 (14 models) |
 | Source code | GitHub: echo313unfolding/helix-substrate |
 | Benchmark receipts | JSON files in each HF model repository |
-| This document | GitHub: EchoLabs33/hxq-whitepaper |
+| This document | GitHub: echo313unfolding/hxq-whitepaper |
 
 All benchmark receipts are machine-readable JSON files containing hardware specifications, software versions, exact hyperparameters, and SHA256 hashes of input data. Any result reported in this paper can be independently reproduced from the corresponding receipt.
 
